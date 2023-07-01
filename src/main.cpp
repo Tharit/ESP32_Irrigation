@@ -16,6 +16,7 @@
 
 #include <MQTT.h>
 #include <ESPAsyncWebServer.h>
+#include <ModbusMaster.h>
 
 #include <NTPClient.h>
 #include <Arduino_JSON.h>
@@ -30,6 +31,12 @@
 #else
 #define SERIALINIT
 #endif
+
+
+// instantiate ModbusMaster object
+ModbusMaster modbus;
+long modbusRead = 0;
+uint16_t batteryPercentage = 0;
 
 // will be computed as "<HOSTNAME>_<MAC-ADDRESS>"
 String Hostname;
@@ -104,22 +111,12 @@ String getOutputStates()
   myArray["cards"][2]["c_text"] = String(MQTT_INTERVAL) + "ms";
   myArray["cards"][3]["c_text"] = String(My_time);
   myArray["cards"][4]["c_text"] = "WiFi = " + String(WiFi_reconnect) + "   MQTT = " + String(Mqtt_reconnect);
-  myArray["cards"][5]["c_text"] = " ";
+  myArray["cards"][5]["c_text"] = String(batteryPercentage);
   myArray["cards"][6]["c_text"] = " to reboot click ok";
 
-  for (int i = 0; i < NUM_OUTPUTS; i++)
-  {
-    myArray["gpios"][i]["output"] = String(i);
-
-    if (relayReset[i] == "Y")
-    {
-      myArray["gpios"][i]["state"] = String(digitalRead(outputGPIOs[i]));
-    }
-    else
-    {
-      myArray["gpios"][i]["state"] = String(!digitalRead(outputGPIOs[i]));
-    }
-  }
+  myArray["gpios"][0]["output"] = String(0);
+  myArray["gpios"][0]["state"] = String(!digitalRead(outputGPIOs[0]));
+  
   String jsonString = JSON.stringify(myArray);
   return jsonString;
 }
@@ -187,11 +184,6 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
       digitalWrite(outputGPIOs[relais], !digitalRead(outputGPIOs[relais]));
       notifyClients(getOutputStates());
       Serial.println("switch Relais");
-
-      if (relayReset[relais] == "Y")
-      {
-        relayResetStatus[relais] = 1;
-      }
     }
   }
 
@@ -319,7 +311,7 @@ void initMQTT() {
 
 void MQTTsend()
 {
-  JSONVar mqtt_data, actuators;
+  JSONVar mqtt_data, actuators, sensors;
 
   String mqtt_tag = Hostname + "/STATUS";
   Serial.printf("%s\n", mqtt_tag.c_str());
@@ -327,15 +319,13 @@ void MQTTsend()
   char property[8];
   strcpy(property, "Relais0");
 
-  for (size_t relais = 0; relais <= 6; relais++)
-  {
-    property[6] = '0' + relais;
-    actuators[(const char*)property] = !digitalRead(outputGPIOs[relais]) ? true : false;
-  }
-  
+  actuators[(const char*)property] = !digitalRead(outputGPIOs[0]) ? true : false;
+  sensors["Battery"] = batteryPercentage;
+
   mqtt_data["Time"] = My_time;
   mqtt_data["RSSI"] = WiFi.RSSI();
   mqtt_data["Actuators"] = actuators;
+  mqtt_data["Sensors"] = sensors;
 
   String mqtt_string = JSON.stringify(mqtt_data);
 
@@ -375,6 +365,12 @@ void setup()
   initWiFi();
   initWebSocket();
   initMQTT();
+
+  // init rs232 comms
+  Serial2.begin(9600, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
+  
+  // communicate with Modbus slave ID 2 over Serial2
+  modbus.begin(1, Serial2);
 
   // Route for root / web page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -424,29 +420,25 @@ void loop()
     }
   }
 
-  // auf Reset prüfen
-  // falls nötig Timer setzten
-  for (int i = 0; i < NUM_OUTPUTS; i++)
-  {
-    if (relayResetStatus[i] == 1)
-    {
-      relayResetStatus[i] = 2;
-      relayResetTimer[i] = now;
-    }
-  }
+  // read modbus slave state
+  if(now - modbusRead > MODBUS_INTERVAL) {
+    modbusRead = now;
 
-  // prüfen ob Timer abgelaufen; wenn ja Relais ausschalten
-  for (int i = 0; i < NUM_OUTPUTS; i++)
-  {
-    if (relayResetStatus[i] == 2)
+    Serial.printf("Reading modbus values...");
+
+    // slave: read 16-bit registers to RX buffer
+    uint16_t result = modbus.readHoldingRegisters(0x100, 1);
+    
+    // do something with data if read is successful
+    if (result == modbus.ku8MBSuccess)
     {
-      if (now - relayResetTimer[i] > RELAY_RESET_INTERVAL)
-      {
-        relayResetStatus[i] = 0;
-        digitalWrite(outputGPIOs[i], HIGH);
-        notifyClients(getOutputStates());
-        Mqtt_lastSend = now - MQTT_INTERVAL - 10; // --> MQTT send !!
-      }
+      Serial.printf("Success!\n");
+
+      // battery charge %
+      batteryPercentage = modbus.getResponseBuffer(0);
+
+    } else {
+      Serial.printf("Failed!\n");
     }
   }
 
